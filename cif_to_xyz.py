@@ -294,65 +294,58 @@ def resolve_disorder(sites: list[dict],
     Keep only the major conformer for each disorder assembly.
 
     Rules:
-      - assembly="." → always keep (ordered atom)
-      - For each assembly letter (A, B, C, …):
-          * collect all named groups (group != ".")
-          * if there are multiple groups: keep the one with highest mean occupancy
-          * if there is only one group (or only group "."): keep it regardless of occupancy,
-            because it has no alternative — dropping it would remove real atoms
-          * sites with group="." inside a named assembly are treated as a separate
-            single-member group
-      - The min_occupancy filter is applied ONLY when multiple groups compete,
-        never to sole-group assemblies.
+      - assembly="." - always keep (ordered atom)
+      - For each assembly letter (A, B, C, ...):
+          * if multiple groups: keep highest-occupancy group
+          * if single group: keep if occ >= min_occupancy/2, else drop
+      - Cross-assembly merging: assemblies whose mean occupancies sum to ~1.0
+        and have the same atom count are treated as alternative conformers of the
+        same disorder - only the highest-occupancy assembly is kept.
+        This handles cases where a crystallographer assigns each conformer of
+        a tert-butyl (or similar group) to a separate assembly letter instead
+        of using groups within one assembly.
     """
     by_assembly: dict[str, list[dict]] = defaultdict(list)
     for s in sites:
         by_assembly[s["assembly"]].append(s)
 
-    kept: list[dict] = []
+    # Step 1: resolve within each assembly
+    resolved: dict[str, list[dict]] = {}
 
     for assembly, asm_sites in by_assembly.items():
         if assembly == ".":
-            kept.extend(asm_sites)
+            resolved[assembly] = list(asm_sites)
             continue
 
-        # Split into named groups
         groups: dict[str, list[dict]] = defaultdict(list)
         for s in asm_sites:
             groups[s["group"]].append(s)
 
-        # Separate "." group (unassigned within assembly) from numbered groups
-        dot_sites   = groups.pop(".", [])
-        named_groups = groups  # remaining: "1", "2", etc.
+        dot_sites    = groups.pop(".", [])
+        named_groups = groups
 
         if len(named_groups) == 0:
-            # Only "." group in this assembly — keep all regardless of occupancy
-            kept.extend(dot_sites)
+            resolved[assembly] = list(dot_sites)
             logger.info(f"  Assembly {assembly}: only unassigned sites, keeping all")
 
         elif len(named_groups) == 1:
-            # Single named group — no alternative conformer.
-            # Keep if mean occupancy >= min_occupancy / 2 (generous threshold),
-            # because even at occ=0.3 these are real atoms with no replacement.
-            # But drop truly minor sites (occ < 0.1) which are likely noise.
             only_group, only_sites = next(iter(named_groups.items()))
             mean_occ = np.mean([s["occupancy"] for s in only_sites])
             sole_threshold = max(min_occupancy / 2, 0.1)
             if mean_occ >= sole_threshold:
+                resolved[assembly] = list(only_sites) + list(dot_sites)
                 logger.info(
                     f"  Assembly {assembly}: single group {only_group} "
-                    f"(mean occ={mean_occ:.2f}), keeping (no alternative)"
+                    f"(mean occ={mean_occ:.2f}), keeping"
                 )
-                kept.extend(only_sites)
-                kept.extend(dot_sites)
             else:
+                resolved[assembly] = []
                 logger.info(
                     f"  Assembly {assembly}: single group {only_group} "
                     f"(mean occ={mean_occ:.2f}), dropping (occ < {sole_threshold:.2f})"
                 )
 
         else:
-            # Multiple groups — pick the one with highest mean occupancy
             best_group = max(
                 named_groups,
                 key=lambda g: np.mean([s["occupancy"] for s in named_groups[g]])
@@ -363,29 +356,64 @@ def resolve_disorder(sites: list[dict],
                 f"  Assembly {assembly}: keeping group {best_group} "
                 f"(mean occ={mean_occ:.2f}), dropping {n_dropped} atoms"
             )
-            kept.extend(named_groups[best_group])
-            # "." sites within a multi-group assembly: keep if occ >= threshold
+            resolved[assembly] = list(named_groups[best_group])
             for s in dot_sites:
                 if s["occupancy"] >= min_occupancy:
-                    kept.append(s)
+                    resolved[assembly].append(s)
 
-    # Final filter: drop only truly minor sites in ordered positions
-    # (assembly=".", occ < min_occupancy — these are genuine noise/errors)
+    # Step 2: merge cross-assembly conformers
+    # Pairs of single-group assemblies with occ summing to ~1.0 and same atom count
+    # are alternative conformers - keep only the highest-occupancy one.
+    named_asms = {k: v for k, v in resolved.items() if k != "." and v}
+    used: set[str] = set()
+    merged_drop: set[str] = set()
+
+    asm_list = sorted(named_asms.keys())
+    for i, a1 in enumerate(asm_list):
+        if a1 in used:
+            continue
+        sites_a1 = named_asms[a1]
+        mean_a1  = np.mean([s["occupancy"] for s in sites_a1])
+        n_a1     = len(sites_a1)
+        partners = [a1]
+
+        for a2 in asm_list[i+1:]:
+            if a2 in used:
+                continue
+            sites_a2 = named_asms[a2]
+            mean_a2  = np.mean([s["occupancy"] for s in sites_a2])
+            n_a2     = len(sites_a2)
+            if n_a1 == n_a2 and abs(mean_a1 + mean_a2 - 1.0) < 0.15:
+                partners.append(a2)
+
+        if len(partners) > 1:
+            best = max(partners,
+                       key=lambda a: np.mean([s["occupancy"] for s in named_asms[a]]))
+            drop = [a for a in partners if a != best]
+            best_occ = np.mean([s["occupancy"] for s in named_asms[best]])
+            logger.info(
+                f"  Cross-assembly disorder: {partners} are alternative conformers "
+                f"-> keeping {best} (occ={best_occ:.2f}), dropping {drop}"
+            )
+            merged_drop.update(drop)
+            used.update(partners)
+
+    # Step 3: collect final kept sites
+    kept: list[dict] = []
+    for assembly, sites_kept in resolved.items():
+        if assembly in merged_drop:
+            continue
+        kept.extend(sites_kept)
+
+    # Final filter for truly minor ordered sites
     before = len(kept)
-    # Only apply min_occ filter to unassembled sites
-    kept = [
-        s for s in kept
-        if s["assembly"] != "." or s["occupancy"] >= min_occupancy
-    ]
-    n_dropped = before - len(kept)
-    if n_dropped:
-        logger.info(f"  Dropped {n_dropped} ordered sites with occupancy < {min_occupancy}")
+    kept = [s for s in kept
+            if s["assembly"] != "." or s["occupancy"] >= min_occupancy]
+    if before - len(kept):
+        logger.info(f"  Dropped {before - len(kept)} ordered sites with occupancy < {min_occupancy}")
 
     logger.info(f"Disorder resolved: {len(kept)} sites kept (was {len(sites)})")
     return kept
-
-
-# ─── Step 3: build bond graph ─────────────────────────────────────────────────
 
 def frac_to_cart(frac: np.ndarray, M: np.ndarray) -> np.ndarray:
     """Convert fractional to Cartesian coordinates. M columns = lattice vectors."""
