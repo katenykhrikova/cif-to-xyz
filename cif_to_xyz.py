@@ -67,6 +67,14 @@ TRANSITION_METALS: frozenset[str] = frozenset({
     "Dy","Ho","Er","Tm","Yb","Lu",
 })
 
+APPROX_MASS: dict[str, float] = {
+    "H":1,"C":12,"N":14,"O":16,"F":19,"P":31,"S":32,
+    "Cl":35,"Br":80,"I":127,"Ir":192,"Ru":101,"Pt":195,
+    "Pd":106,"Rh":103,"Os":190,"Au":197,"Re":186,
+    "Co":59,"Ni":58,"Cu":64,"Fe":56,"Mn":55,"Zn":65,
+}
+
+
 # Covalent radii (Å) for bond detection
 COVALENT_RADII: dict[str, float] = {
     "H":0.31,"C":0.76,"N":0.71,"O":0.66,"F":0.57,"P":1.07,"S":1.05,
@@ -186,6 +194,98 @@ def parse_cif(cif_path: Path) -> tuple[np.ndarray, list[dict]]:
     return M, sites
 
 
+# ─── Symmetry expansion ───────────────────────────────────────────────────────
+
+def parse_symops(cif_text: str) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Parse symmetry operations from CIF text.
+    Returns list of (R, t) where R is 3x3 rotation matrix, t is translation vector.
+    """
+    blocks = re.split(r"\nloop_", cif_text)
+    sym_block = next(
+        (b for b in blocks
+         if "_space_group_symop_operation_xyz" in b
+         or "_symmetry_equiv_pos_as_xyz" in b),
+        None
+    )
+    if not sym_block:
+        return [(np.eye(3), np.zeros(3))]  # P1 fallback
+
+    symops = []
+    for line in sym_block.splitlines():
+        s = line.strip().strip("'\"")
+        if re.match(r"^[-xyz0-9/+., ]+$", s) and "," in s:
+            R = np.zeros((3, 3))
+            t = np.zeros(3)
+            for i, part in enumerate(s.split(",")):
+                part = part.strip()
+                m = re.search(r"([+-]?\d+)/(\d+)", part)
+                if m:
+                    t[i] = int(m.group(1)) / int(m.group(2))
+                for j, var in enumerate("xyz"):
+                    m = re.search(r"([+-]?)(\d*\.?\d*)" + var, part)
+                    if m:
+                        sign = -1 if m.group(1) == "-" else 1
+                        coef = float(m.group(2)) if m.group(2) not in ("", ".") else 1.0
+                        R[i, j] = sign * coef
+            symops.append((R, t))
+    return symops if symops else [(np.eye(3), np.zeros(3))]
+
+
+def expand_to_unit_cell(sites: list[dict],
+                        symops: list[tuple[np.ndarray, np.ndarray]],
+                        tol: float = 0.02) -> list[dict]:
+    """
+    Apply all symmetry operations to the asymmetric unit.
+    Normalise fractional coordinates to [0, 1) and deduplicate equivalent positions.
+    Returns expanded list of sites covering the full unit cell.
+    """
+    expanded: list[dict] = []
+    seen: list[np.ndarray] = []
+
+    for site in sites:
+        frac = site["frac"]
+        for R, t in symops:
+            new_frac = (R @ frac + t) % 1.0
+            dup = any(
+                np.linalg.norm((new_frac - sf) - np.round(new_frac - sf)) < tol
+                for sf in seen
+            )
+            if not dup:
+                expanded.append({**site, "frac": new_frac})
+                seen.append(new_frac)
+
+    return expanded
+
+
+def build_pbc_bond_graph(symbols, fracs, M, tolerance=0.4):
+    """
+    Build covalent bond graph with PBC using a KD-tree for efficiency.
+    O(N log N) instead of O(N^2 * 27).
+    """
+    from scipy.spatial import cKDTree
+    n = len(symbols)
+    radii = np.array([COVALENT_RADII.get(s, DEFAULT_RADIUS) for s in symbols])
+    max_bond = float(radii.max() * 2 * (1 + tolerance))
+    cart = fracs @ M.T
+    adj = defaultdict(set)
+    images = [(di,dj,dk) for di in (-1,0,1) for dj in (-1,0,1) for dk in (-1,0,1)]
+    tree = cKDTree(cart)
+    for di, dj, dk in images:
+        shift_cart = np.array([di,dj,dk], dtype=float) @ M.T
+        shifted = cart + shift_cart
+        pairs = tree.query_ball_tree(cKDTree(shifted), r=max_bond)
+        for i, neighbours in enumerate(pairs):
+            for j in neighbours:
+                if i == j and di == 0 and dj == 0 and dk == 0:
+                    continue
+                thresh = (radii[i] + radii[j % n]) * (1 + tolerance)
+                if np.linalg.norm(cart[i] - shifted[j]) < thresh:
+                    adj[i].add(j % n)
+                    adj[j % n].add(i)
+    return adj
+
+
 # ─── Step 2: resolve disorder ─────────────────────────────────────────────────
 
 def resolve_disorder(sites: list[dict],
@@ -196,11 +296,15 @@ def resolve_disorder(sites: list[dict],
     Rules:
       - assembly="." → always keep (ordered atom)
       - For each assembly letter (A, B, C, …):
-          find the group with the highest mean occupancy → keep only that group
-      - After group selection, drop any site with occupancy < min_occupancy
-        (catches residual minor-conformer sites not labelled with a group)
+          * collect all named groups (group != ".")
+          * if there are multiple groups: keep the one with highest mean occupancy
+          * if there is only one group (or only group "."): keep it regardless of occupancy,
+            because it has no alternative — dropping it would remove real atoms
+          * sites with group="." inside a named assembly are treated as a separate
+            single-member group
+      - The min_occupancy filter is applied ONLY when multiple groups compete,
+        never to sole-group assemblies.
     """
-    # Group sites by assembly
     by_assembly: dict[str, list[dict]] = defaultdict(list)
     for s in sites:
         by_assembly[s["assembly"]].append(s)
@@ -209,34 +313,73 @@ def resolve_disorder(sites: list[dict],
 
     for assembly, asm_sites in by_assembly.items():
         if assembly == ".":
-            # Ordered — keep all
             kept.extend(asm_sites)
             continue
 
-        # Find groups within this assembly
+        # Split into named groups
         groups: dict[str, list[dict]] = defaultdict(list)
         for s in asm_sites:
             groups[s["group"]].append(s)
 
-        # Pick the group with highest mean occupancy
-        best_group = max(
-            groups,
-            key=lambda g: np.mean([s["occupancy"] for s in groups[g]])
-        )
-        mean_occ = np.mean([s["occupancy"] for s in groups[best_group]])
-        logger.info(
-            f"  Assembly {assembly}: keeping group {best_group} "
-            f"(mean occ={mean_occ:.2f}), "
-            f"dropping {len(asm_sites) - len(groups[best_group])} atoms"
-        )
-        kept.extend(groups[best_group])
+        # Separate "." group (unassigned within assembly) from numbered groups
+        dot_sites   = groups.pop(".", [])
+        named_groups = groups  # remaining: "1", "2", etc.
 
-    # Final low-occupancy filter
+        if len(named_groups) == 0:
+            # Only "." group in this assembly — keep all regardless of occupancy
+            kept.extend(dot_sites)
+            logger.info(f"  Assembly {assembly}: only unassigned sites, keeping all")
+
+        elif len(named_groups) == 1:
+            # Single named group — no alternative conformer.
+            # Keep if mean occupancy >= min_occupancy / 2 (generous threshold),
+            # because even at occ=0.3 these are real atoms with no replacement.
+            # But drop truly minor sites (occ < 0.1) which are likely noise.
+            only_group, only_sites = next(iter(named_groups.items()))
+            mean_occ = np.mean([s["occupancy"] for s in only_sites])
+            sole_threshold = max(min_occupancy / 2, 0.1)
+            if mean_occ >= sole_threshold:
+                logger.info(
+                    f"  Assembly {assembly}: single group {only_group} "
+                    f"(mean occ={mean_occ:.2f}), keeping (no alternative)"
+                )
+                kept.extend(only_sites)
+                kept.extend(dot_sites)
+            else:
+                logger.info(
+                    f"  Assembly {assembly}: single group {only_group} "
+                    f"(mean occ={mean_occ:.2f}), dropping (occ < {sole_threshold:.2f})"
+                )
+
+        else:
+            # Multiple groups — pick the one with highest mean occupancy
+            best_group = max(
+                named_groups,
+                key=lambda g: np.mean([s["occupancy"] for s in named_groups[g]])
+            )
+            mean_occ = np.mean([s["occupancy"] for s in named_groups[best_group]])
+            n_dropped = sum(len(v) for k, v in named_groups.items() if k != best_group)
+            logger.info(
+                f"  Assembly {assembly}: keeping group {best_group} "
+                f"(mean occ={mean_occ:.2f}), dropping {n_dropped} atoms"
+            )
+            kept.extend(named_groups[best_group])
+            # "." sites within a multi-group assembly: keep if occ >= threshold
+            for s in dot_sites:
+                if s["occupancy"] >= min_occupancy:
+                    kept.append(s)
+
+    # Final filter: drop only truly minor sites in ordered positions
+    # (assembly=".", occ < min_occupancy — these are genuine noise/errors)
     before = len(kept)
-    kept = [s for s in kept if s["occupancy"] >= min_occupancy]
+    # Only apply min_occ filter to unassembled sites
+    kept = [
+        s for s in kept
+        if s["assembly"] != "." or s["occupancy"] >= min_occupancy
+    ]
     n_dropped = before - len(kept)
     if n_dropped:
-        logger.info(f"  Dropped {n_dropped} sites with occupancy < {min_occupancy}")
+        logger.info(f"  Dropped {n_dropped} ordered sites with occupancy < {min_occupancy}")
 
     logger.info(f"Disorder resolved: {len(kept)} sites kept (was {len(sites)})")
     return kept
@@ -315,6 +458,21 @@ def contains_metal(indices: list[int], symbols: list[str],
         elif el in TRANSITION_METALS:
             return True
     return False
+
+
+def classify_fragment_symbols(syms: list[str],
+                              target_metal: Optional[str] = None) -> str:
+    """Classify a fragment given a list of element symbols (no index lookup)."""
+    formula = hill_formula(syms)
+    if any(s == target_metal for s in syms) if target_metal else any(s in TRANSITION_METALS for s in syms):
+        return "complex"
+    if len(syms) == 1:
+        return "counterion"
+    if formula in SOLVENT_FORMULAS:
+        return "solvent"
+    if formula in COUNTERION_FORMULAS:
+        return "counterion"
+    return "unknown"
 
 
 def classify_fragment(indices: list[int], symbols: list[str],
@@ -449,6 +607,7 @@ def cif_to_xyz(
 
     # 1. Parse asymmetric unit directly from CIF text
     M, sites = parse_cif(cif_path)
+    cif_text = cif_path.read_text(encoding="utf-8", errors="replace")
 
     # 2. Resolve disorder using assembly/group labels
     logger.info("Resolving disorder...")
@@ -457,17 +616,116 @@ def cif_to_xyz(
     # 3. Convert fractional → Cartesian (preserving coords outside [0,1))
     symbols = [s["symbol"] for s in sites]
     coords  = np.array([frac_to_cart(s["frac"], M) for s in sites])
-
     logger.info(f"Clean asymmetric unit: {len(symbols)} atoms")
 
-    # 4-5. Find and extract the complex
-    out_symbols, out_coords, report = extract_complex(
-        symbols, coords,
-        target_metal=target_metal,
-        keep_counterions=keep_counterions,
-        keep_all=keep_all,
-        one_molecule=one_molecule,
-    )
+    # 4. Check if the asymmetric unit contains a complete molecule.
+    #    If the largest metal fragment seems incomplete (Z' < 1, e.g. half a dimer),
+    #    expand the asymmetric unit using all symmetry operations and use a
+    #    PBC-aware bond graph to find the full complex.
+    adj_asu  = build_bond_graph_cart(symbols, coords)
+    comps_asu = connected_components(adj_asu, len(symbols))
+    metal_frags_asu = [c for c in comps_asu
+                       if any(symbols[i] in TRANSITION_METALS or
+                              (target_metal and symbols[i] == target_metal)
+                              for i in c)]
+
+    needs_expansion = False
+    if metal_frags_asu:
+        largest_metal = max(metal_frags_asu, key=len)
+        metal_syms = [symbols[i] for i in largest_metal]
+        # Heuristic: if there is only 1 metal atom but the space group has
+        # symmetry operations that produce a closer metal image (< 6 Å),
+        # this is likely Z' = 0.5 and we need to expand
+        symops = parse_symops(cif_text)
+        if len(symops) > 1:
+            metal_idx = next(i for i in largest_metal if symbols[i] in TRANSITION_METALS
+                             or (target_metal and symbols[i] == target_metal))
+            metal_frac = np.array(sites[metal_idx]["frac"]) % 1.0
+            for R, t in symops[1:]:  # skip identity
+                img_frac = (R @ metal_frac + t) % 1.0
+                d_frac = img_frac - metal_frac
+                d_frac -= np.round(d_frac)
+                d_cart = np.linalg.norm(M @ d_frac)
+                if d_cart < 6.0:  # Å — another metal centre nearby → dimer/oligomer
+                    logger.info(
+                        f"Z' < 1 detected: symmetry-equivalent metal at {d_cart:.2f} Å. "
+                        "Expanding asymmetric unit to recover full complex."
+                    )
+                    needs_expansion = True
+                    break
+
+    if needs_expansion:
+        symops = parse_symops(cif_text)
+        expanded_sites = expand_to_unit_cell(sites, symops)
+        logger.info(f"Expanded unit cell: {len(expanded_sites)} sites")
+        symbols = [s["symbol"] for s in expanded_sites]
+        fracs   = np.array([s["frac"] for s in expanded_sites])
+        adj     = build_pbc_bond_graph(symbols, fracs, M)
+        comps   = connected_components(adj, len(symbols))
+
+        # For PBC graph: unwrap the selected complex fragment from the metal
+        def unwrap_fragment(frag, adj, fracs, M):
+            frag_set = set(frag)
+            start = next(i for i in frag if symbols[i] in TRANSITION_METALS
+                         or (target_metal and symbols[i] == target_metal))
+            unwrapped = {start: fracs[start].copy()}
+            queue = [start]
+            while queue:
+                cur = queue.pop(0)
+                for nb in adj.get(cur, set()):
+                    if nb not in frag_set or nb in unwrapped:
+                        continue
+                    d = fracs[nb] - unwrapped[cur]
+                    d -= np.round(d)
+                    unwrapped[nb] = unwrapped[cur] + d
+                    queue.append(nb)
+            for i in frag:
+                if i not in unwrapped:
+                    best = min(unwrapped, key=lambda r: np.linalg.norm(
+                        ((fracs[i]-unwrapped[r])-np.round(fracs[i]-unwrapped[r])) @ M.T))
+                    d = fracs[i] - unwrapped[best]
+                    d -= np.round(d)
+                    unwrapped[i] = unwrapped[best] + d
+            return np.array([unwrapped[i] @ M.T for i in frag])
+
+        classified: dict[str, list[list[int]]] = defaultdict(list)
+        for comp in comps:
+            label = classify_fragment_symbols([symbols[i] for i in comp], target_metal)
+            classified[label].append(comp)
+
+        if not classified["complex"]:
+            classified["complex"].append(max(comps, key=len))
+
+        n_cx = len(classified["complex"])
+        if n_cx > 1 and one_molecule:
+            best = max(classified["complex"], key=len)
+            logger.info(f"Keeping 1 complex ({len(best)} atoms) from {n_cx} found")
+            classified["complex"] = [best]
+
+        selected = sorted(set(i for frag in classified["complex"] for i in frag))
+        if keep_counterions:
+            selected += [i for frag in classified.get("counterion", []) for i in frag]
+
+        out_symbols = [symbols[i] for i in selected]
+        out_coords  = unwrap_fragment(selected, adj, fracs, M)
+
+        masses = np.array([APPROX_MASS.get(s, 50.0) for s in out_symbols])
+        com    = (out_coords * masses[:, None]).sum(0) / masses.sum()
+        out_coords -= com
+
+        report = {k: len(v) for k, v in classified.items()}
+        logger.info(f"Full complex: {len(out_symbols)} atoms, "
+                    f"formula: {hill_formula(out_symbols)}")
+
+    else:
+        # 5. Standard extraction (complete molecule in asymmetric unit)
+        out_symbols, out_coords, report = extract_complex(
+            symbols, coords,
+            target_metal=target_metal,
+            keep_counterions=keep_counterions,
+            keep_all=keep_all,
+            one_molecule=one_molecule,
+        )
 
     comment = (
         f"Source: {cif_path.name} | formula: {hill_formula(out_symbols)} | "
