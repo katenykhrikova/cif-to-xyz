@@ -3,7 +3,7 @@
 A Python tool that extracts a single coordination complex molecule from a CIF 
 crystallographic file — removing solvent, counterions, and disorder.
 
-![after](illustration.png)
+![demostration](assets/illustration.png)
 
 ## What it does
 
@@ -46,7 +46,7 @@ for f in structures/*.cif; do python cif_to_xyz.py "$f" --metal Ir; done
 
 ## Web app
 
-A Streamlit web interface is available at: [https://cif-to-xyz-converter.streamlit.app]
+A Streamlit web interface is available at: https://cif-to-xyz-converter.streamlit.app
 
 Upload a CIF file, select options, and download the resulting XYZ — 
 no installation required.
